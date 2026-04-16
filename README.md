@@ -185,6 +185,14 @@ The quantized models are hosted on HuggingFace and downloaded automatically on f
 
 > **Note:** Group offload trades speed for VRAM savings (roughly 1.5x slower). NF4 quantization has minimal speed overhead but reduces model weight memory.
 
+**8 GB GPUs**: Block swap pipeline achieves ~8 GB peak VRAM at 1280 resolution with bf16 precision:
+
+```bash
+python inference/scripts/inference_psd_blockswap.py \
+  --srcp assets/test_image.png \
+  --save_to_psd \
+```
+
 ### Preparing the dataset for training (e.g., Live2D Parsing)
 
 We have provided a separate repo for you to prepare the dataset for training the Live2D parsing model. Please refer to [CubismPartExtr](https://github.com/shitagaki-lab/CubismPartExtr) to know how to download the sample model files and prepare your workspace folder. 
