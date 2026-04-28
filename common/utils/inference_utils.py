@@ -334,12 +334,12 @@ def apply_marigold(srcp, pretrained: str, num_inference_steps=-1, seed=0, save_d
                 except Exception as _oe:
                     print(f'[dual-GPU] Warning: could not offload UNet: {_oe!r}')
 
-        unet = UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet')
-        marigold_pipeline = MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet)
+        unet = UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet', torch_dtype=torch.float16)
+        marigold_pipeline = MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet, torch_dtype=torch.float16)
 
         # Put Marigold on the secondary GPU to avoid VRAM contention with layerdiff
         marigold_dev = _get_device(1)
-        marigold_pipeline.to(device=marigold_dev, dtype=torch.bfloat16)
+        marigold_pipeline.to(device=marigold_dev, dtype=torch.float16)
         if DUAL_GPU_MODE:
             print(f'[dual-GPU] marigold → {marigold_dev}')
 
