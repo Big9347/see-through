@@ -18,6 +18,26 @@ import numpy as np
 import torch
 from PIL import Image
 
+# ---------------------------------------------------------------------------
+# Dual-GPU configuration
+# ---------------------------------------------------------------------------
+# Set DUAL_GPU_MODE = True to split workload across two GPUs (Kaggle T4 x2).
+# Strategy:
+#   - LayerDiff : UNet + VAE + TransVAE  → cuda:0  (compute-heavy)
+#                 text_encoder + text_encoder_2 → cuda:1 (memory-heavy)
+#   - Marigold  : entire pipeline         → cuda:1
+#
+# When only one GPU is available, everything falls back to cuda:0 silently.
+# ---------------------------------------------------------------------------
+DUAL_GPU_MODE: bool = torch.cuda.device_count() >= 2
+
+
+def _get_device(slot: int = 0) -> str:
+    """Return 'cuda:<slot>' when dual-GPU mode is active, else 'cuda:0'."""
+    if DUAL_GPU_MODE and torch.cuda.device_count() > slot:
+        return f'cuda:{slot}'
+    return 'cuda'
+
 VALID_BODY_PARTS_V2 = [
     'hair', 'headwear', 'face', 'eyes', 'eyewear', 'ears', 'earwear', 'nose', 'mouth', 
     'neck', 'neckwear', 'topwear', 'handwear', 'bottomwear', 'legwear', 'footwear', 
@@ -62,13 +82,23 @@ def apply_layerdiff(
                 layerdiff_pipeline.trans_vae.decoder.load_state_dict(td_sd)
                 print(f'load vae from {vae_ckpt}')
 
-        layerdiff_pipeline.vae.to(dtype=torch.bfloat16, device='cuda')
-        layerdiff_pipeline.trans_vae.to(dtype=torch.bfloat16, device='cuda')
-        layerdiff_pipeline.unet.to(dtype=torch.bfloat16, device='cuda')
-        layerdiff_pipeline.text_encoder.to(dtype=torch.bfloat16, device='cuda')
-        layerdiff_pipeline.text_encoder_2.to(dtype=torch.bfloat16, device='cuda')
+        # -- Device assignment -------------------------------------------------
+        # Primary device (cuda:0): compute-intensive diffusion components
+        dev0 = _get_device(0)
+        # Secondary device (cuda:1 when available): text encoders + Marigold
+        dev1 = _get_device(1)
+
+        layerdiff_pipeline.vae.to(dtype=torch.bfloat16, device=dev0)
+        layerdiff_pipeline.trans_vae.to(dtype=torch.bfloat16, device=dev0)
+        layerdiff_pipeline.unet.to(dtype=torch.bfloat16, device=dev0)
+        # Text encoders are large but run once per batch — offload to dev1
+        layerdiff_pipeline.text_encoder.to(dtype=torch.bfloat16, device=dev1)
+        layerdiff_pipeline.text_encoder_2.to(dtype=torch.bfloat16, device=dev1)
         if group_offload:
-            layerdiff_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)
+            layerdiff_pipeline.enable_group_offload(dev0, num_blocks_per_group=1)
+
+        if DUAL_GPU_MODE:
+            print(f'[dual-GPU] layerdiff: UNet/VAE → {dev0} | text encoders → {dev1}')
 
     pipeline = layerdiff_pipeline
     if cache_tag_embeds:
@@ -192,10 +222,15 @@ def apply_marigold(srcp, pretrained: str, num_inference_steps=-1, seed=0, save_d
     if marigold_pipeline is None:
         unet = UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet')
         marigold_pipeline = MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet)
-        marigold_pipeline.to(device='cuda', dtype=torch.bfloat16)
+
+        # Put Marigold on the secondary GPU to avoid VRAM contention with layerdiff
+        marigold_dev = _get_device(1)
+        marigold_pipeline.to(device=marigold_dev, dtype=torch.bfloat16)
+        if DUAL_GPU_MODE:
+            print(f'[dual-GPU] marigold → {marigold_dev}')
 
         if group_offload:
-            marigold_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)
+            marigold_pipeline.enable_group_offload(marigold_dev, num_blocks_per_group=1)
 
     pipe = marigold_pipeline
 
