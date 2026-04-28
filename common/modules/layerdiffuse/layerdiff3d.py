@@ -327,6 +327,8 @@ class CrossFrameAttnUpBlock(nn.Module):
                     b2=self.b2,
                 )
 
+            # Guard against cross-device skip connections (model parallelism across GPUs)
+            res_hidden_states = res_hidden_states.to(hidden_states.device)
             hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
 
             if torch.is_grad_enabled() and self.gradient_checkpointing:
@@ -1829,6 +1831,15 @@ class UNetFrameConditionModel(
 
             res_samples = down_block_res_samples[-len(upsample_block.resnets) :]
             down_block_res_samples = down_block_res_samples[: -len(upsample_block.resnets)]
+
+            # Move skip-connection tensors to the up-block's device.
+            # When the UNet is split across GPUs (model parallelism), down-blocks
+            # produce skip tensors on cuda:0 but up-blocks may live on cuda:1.
+            try:
+                _up_dev = next(upsample_block.parameters()).device
+                res_samples = tuple(t.to(_up_dev) for t in res_samples)
+            except StopIteration:
+                pass  # block has no parameters (rare), leave tensors as-is
 
             # if we have not reached the final block and need to forward the
             # upsample size, we do it here
