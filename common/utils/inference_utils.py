@@ -46,11 +46,29 @@ VALID_BODY_PARTS_V2 = [
 
 
 layerdiff_pipeline: KDiffusionStableDiffusionXLPipeline = None
+# Persists the saved hf_device_map so we can re-dispatch after Marigold offload
+_ld_unet_device_map: dict = None
+
 def apply_layerdiff(
     imgp: str, pretrained: str, num_inference_steps=30, seed=0, save_dir='workspace/layerdiff_output', target_tag_list=VALID_BODY_PARTS_V2, 
     resolution=1280, vae_ckpt=None, unet_ckpt=None, disable_progressbar=False, cache_tag_embeds=True, group_offload=False):
     
-    global layerdiff_pipeline
+    global layerdiff_pipeline, _ld_unet_device_map
+
+    # If the UNet was offloaded to CPU by apply_marigold, re-dispatch it before inference.
+    if (
+        DUAL_GPU_MODE
+        and layerdiff_pipeline is not None
+        and _ld_unet_device_map is not None
+        and next(iter(layerdiff_pipeline.unet.parameters())).device.type == 'cpu'
+    ):
+        from accelerate import dispatch_model
+        print('[dual-GPU] Re-dispatching UNet from CPU → GPUs for LayerDiff...')
+        layerdiff_pipeline.unet = dispatch_model(
+            layerdiff_pipeline.unet, device_map=_ld_unet_device_map
+        )
+        torch.cuda.empty_cache()
+        print('[dual-GPU] UNet back on GPUs.')
 
     # --- Diagnostics (printed once on first load) ----------------------------
     if layerdiff_pipeline is None:
@@ -75,15 +93,24 @@ def apply_layerdiff(
         if DUAL_GPU_MODE and not group_offload:
             try:
                 print(f'[dual-GPU] loading UNet with device_map="balanced"...')
+                # Without max_memory, 'balanced' puts the whole ~8GB BF16 UNet on
+                # GPU 0 because it fits within the 15GB T4.  Capping each GPU at
+                # 4 500 MiB forces accelerate to split — neither GPU can hold 8GB
+                # alone, guaranteeing real model parallelism on the denoising loop.
+                # (VAE / text-encoder budgets are separate; they are not part of
+                # the UNet from_pretrained call.)
+                _unet_max_mem = {0: '4500MiB', 1: '4500MiB'}
                 unet = UNetFrameConditionModel.from_pretrained(
                     _unet_src,
                     **_unet_subfolder,
                     device_map='balanced',
                     torch_dtype=torch.bfloat16,
+                    max_memory=_unet_max_mem,
                 )
                 _unet_dispatched = True
+                _ld_unet_device_map = dict(getattr(unet, 'hf_device_map', {}))
                 print(f'[dual-GPU] UNet loaded with device_map — '
-                      f'hf_device_map={getattr(unet, "hf_device_map", "N/A")}')
+                      f'hf_device_map={_ld_unet_device_map}')
             except Exception as _e:
                 print(f'[dual-GPU] device_map load failed ({_e!r}), loading normally')
                 unet = UNetFrameConditionModel.from_pretrained(_unet_src, **_unet_subfolder)
@@ -287,6 +314,25 @@ def apply_marigold(srcp, pretrained: str, num_inference_steps=-1, seed=0, save_d
     resolution=768, normalize_depth=False, disable_progressbar=False, cache_tag_embeds=True, group_offload=False):
     global marigold_pipeline
     if marigold_pipeline is None:
+        # ── Free the LayerDiff UNet from GPU 1 before loading Marigold ──────────
+        # When the UNet is split (max_memory), its second half occupies ~4.5 GB on
+        # GPU 1, leaving too little VRAM for Marigold inference.  We offload it to
+        # CPU here; apply_layerdiff will re-dispatch it on the next LD call.
+        if DUAL_GPU_MODE and layerdiff_pipeline is not None and _ld_unet_device_map:
+            _free_gb = torch.cuda.mem_get_info(1)[0] / 1024**3
+            if _free_gb < 10.0:
+                print(f'[dual-GPU] GPU 1 has only {_free_gb:.1f} GB free — '
+                      f'offloading LayerDiff UNet to CPU for Marigold...')
+                try:
+                    from accelerate.hooks import remove_hook_from_module
+                    remove_hook_from_module(layerdiff_pipeline.unet, recurse=True)
+                    layerdiff_pipeline.unet.to('cpu')
+                    torch.cuda.empty_cache()
+                    _free_gb2 = torch.cuda.mem_get_info(1)[0] / 1024**3
+                    print(f'[dual-GPU] GPU 1 now {_free_gb2:.1f} GB free.')
+                except Exception as _oe:
+                    print(f'[dual-GPU] Warning: could not offload UNet: {_oe!r}')
+
         unet = UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet')
         marigold_pipeline = MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet)
 
@@ -298,6 +344,20 @@ def apply_marigold(srcp, pretrained: str, num_inference_steps=-1, seed=0, save_d
 
         if group_offload:
             marigold_pipeline.enable_group_offload(marigold_dev, num_blocks_per_group=1)
+
+        # ── Memory-efficient attention (REQUIRED at 512+ px with many body parts) ─
+        # Marigold passes all ~19 body-part frames through the UNet in one batch.
+        # Standard SDPA materialises the full spatial attention matrix:
+        #   peak ≈ num_frames × heads × seq_len² × 2 bytes
+        #   ≈ 19 × 16 × 4096² × 2 ≈ 10 GB  per attention layer  →  30+ GB total
+        # xformers (flash-attention) is O(N) memory; attention_slicing is the
+        # fallback (processes 1 head at a time, ~640 MB instead of 10 GB).
+        try:
+            marigold_pipeline.enable_xformers_memory_efficient_attention()
+            print('[marigold] xformers memory-efficient attention ✓')
+        except Exception:
+            marigold_pipeline.enable_attention_slicing(slice_size=1)
+            print('[marigold] xformers unavailable — attention slicing (1 head) ✓')
 
     pipe = marigold_pipeline
 
