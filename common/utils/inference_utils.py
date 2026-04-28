@@ -94,18 +94,19 @@ def apply_layerdiff(
             try:
                 print(f'[dual-GPU] loading UNet with device_map="balanced"...')
                 # Without max_memory, 'balanced' puts the whole ~8GB BF16 UNet on
-                # GPU 0 because it fits within the 15GB T4.  Capping each GPU at
-                # 4 500 MiB forces accelerate to split — neither GPU can hold 8GB
+                # GPU 0 because it fits within the 15GB T4. Capping each GPU at
+                # 7000 MiB forces accelerate to split — neither GPU can hold 8GB
                 # alone, guaranteeing real model parallelism on the denoising loop.
                 # (VAE / text-encoder budgets are separate; they are not part of
                 # the UNet from_pretrained call.)
-                _unet_max_mem = {0: '4500MiB', 1: '4500MiB'}
+                _unet_max_mem = {0: '7000MiB', 1: '7000MiB'}
                 unet = UNetFrameConditionModel.from_pretrained(
                     _unet_src,
                     **_unet_subfolder,
                     device_map='balanced',
                     torch_dtype=torch.bfloat16,
                     max_memory=_unet_max_mem,
+                    offload_folder='workspace/offload',
                 )
                 _unet_dispatched = True
                 _ld_unet_device_map = dict(getattr(unet, 'hf_device_map', {}))
