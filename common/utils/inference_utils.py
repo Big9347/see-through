@@ -51,13 +51,47 @@ def apply_layerdiff(
     resolution=1280, vae_ckpt=None, unet_ckpt=None, disable_progressbar=False, cache_tag_embeds=True, group_offload=False):
     
     global layerdiff_pipeline
+
+    # --- Diagnostics (printed once on first load) ----------------------------
     if layerdiff_pipeline is None:
+        _n_gpu = torch.cuda.device_count()
+        print(f'[GPU] device_count={_n_gpu}  DUAL_GPU_MODE={DUAL_GPU_MODE}')
+        for _i in range(_n_gpu):
+            _props = torch.cuda.get_device_properties(_i)
+            _free, _total = torch.cuda.mem_get_info(_i)
+            print(f'[GPU {_i}] {_props.name}  free={_free/1024**3:.1f}GB / {_total/1024**3:.1f}GB')
+
+        dev0 = _get_device(0)
+        dev1 = _get_device(1)
+
         trans_vae = TransparentVAE.from_pretrained(pretrained, subfolder='trans_vae')
-        if unet_ckpt is None:
-            unet = UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet')
+
+        # --- UNet: try device_map='balanced' at load time (best for diffusers) --
+        _unet_src = pretrained if unet_ckpt is None else unet_ckpt
+        _unet_kwargs = {} if unet_ckpt is None else {}
+        _unet_subfolder = {'subfolder': 'unet'} if unet_ckpt is None else {}
+        _unet_dispatched = False
+
+        if DUAL_GPU_MODE and not group_offload:
+            try:
+                print(f'[dual-GPU] loading UNet with device_map="balanced"...')
+                unet = UNetFrameConditionModel.from_pretrained(
+                    _unet_src,
+                    **_unet_subfolder,
+                    device_map='balanced',
+                    torch_dtype=torch.bfloat16,
+                )
+                _unet_dispatched = True
+                print(f'[dual-GPU] UNet loaded with device_map — '
+                      f'hf_device_map={getattr(unet, "hf_device_map", "N/A")}')
+            except Exception as _e:
+                print(f'[dual-GPU] device_map load failed ({_e!r}), loading normally')
+                unet = UNetFrameConditionModel.from_pretrained(_unet_src, **_unet_subfolder)
         else:
-            print(f'load unet from {unet_ckpt}')
-            unet = UNetFrameConditionModel.from_pretrained(unet_ckpt)
+            if unet_ckpt is not None:
+                print(f'load unet from {unet_ckpt}')
+            unet = UNetFrameConditionModel.from_pretrained(_unet_src, **_unet_subfolder)
+
         layerdiff_pipeline = KDiffusionStableDiffusionXLPipeline.from_pretrained(
             pretrained,
             trans_vae=trans_vae, unet=unet,
@@ -83,33 +117,25 @@ def apply_layerdiff(
                 print(f'load vae from {vae_ckpt}')
 
         # -- Device assignment -------------------------------------------------
-        dev0 = _get_device(0)
-        dev1 = _get_device(1)
-
         layerdiff_pipeline.vae.to(dtype=torch.bfloat16, device=dev0)
         layerdiff_pipeline.trans_vae.to(dtype=torch.bfloat16, device=dev0)
         # Text encoders run once per call — keep on dev1 to free VRAM on dev0
         layerdiff_pipeline.text_encoder.to(dtype=torch.bfloat16, device=dev1)
         layerdiff_pipeline.text_encoder_2.to(dtype=torch.bfloat16, device=dev1)
 
-        if DUAL_GPU_MODE and not group_offload:
-            # ---- Real compute split: dispatch UNet layers across both GPUs ----
-            # accelerate inserts forward-hooks that move activations between
-            # devices so every 30-step denoising iteration uses both T4s.
-            # VAE/TransVAE (~2GB) on cuda:0 + half UNet (~2.5GB) → ~4.5 GB
-            # text encoders (~3.5GB) on cuda:1 + half UNet (~2.5GB) → ~6 GB
+        if _unet_dispatched:
+            # Already on correct devices from from_pretrained device_map
+            print(f'[dual-GPU] UNet already dispatched | '
+                  f'text encoders → {dev1} | VAE → {dev0}')
+        elif DUAL_GPU_MODE and not group_offload:
+            # device_map='balanced' failed — try post-hoc accelerate dispatch
             try:
                 from accelerate import dispatch_model, infer_auto_device_map
-                # Bring UNet to CPU+bf16 so infer_auto_device_map sees sizes correctly
                 layerdiff_pipeline.unet.to(dtype=torch.bfloat16).cpu()
-                # Reserve headroom for activations; T4 has 15 GiB each
                 _max_mem = {0: '9500MiB', 1: '7500MiB'}
-                # Don't split these atom units mid-layer (standard diffusers block names)
                 _no_split = [
-                    'BasicTransformerBlock',
-                    'ResnetBlock2D',
-                    'Transformer2DModel',
-                    'TemporalBasicTransformerBlock',
+                    'BasicTransformerBlock', 'ResnetBlock2D',
+                    'Transformer2DModel', 'TemporalBasicTransformerBlock',
                 ]
                 unet_map = infer_auto_device_map(
                     layerdiff_pipeline.unet,
@@ -120,20 +146,25 @@ def apply_layerdiff(
                 layerdiff_pipeline.unet = dispatch_model(
                     layerdiff_pipeline.unet, device_map=unet_map
                 )
-                _used_devs = set(unet_map.values())
-                print(f'[dual-GPU] UNet dispatched across {_used_devs} | '
-                      f'text encoders → {dev1} | VAE → {dev0}')
+                print(f'[dual-GPU] UNet post-hoc dispatched across '
+                      f'{set(unet_map.values())} | text encoders → {dev1}')
             except Exception as _e:
-                print(f'[dual-GPU] UNet dispatch failed ({_e!r}), falling back to {dev0}')
+                print(f'[dual-GPU] !! Both dispatch methods failed: {_e!r}')
+                print(f'[dual-GPU] !! Running single-GPU on {dev0}')
                 layerdiff_pipeline.unet.to(dtype=torch.bfloat16, device=dev0)
         else:
             layerdiff_pipeline.unet.to(dtype=torch.bfloat16, device=dev0)
             if DUAL_GPU_MODE:
-                # group_offload manages its own device movement
-                print(f'[dual-GPU] group_offload active — UNet managed by offload on {dev0}')
+                print(f'[dual-GPU] group_offload active — UNet on {dev0}')
 
         if group_offload:
             layerdiff_pipeline.enable_group_offload(dev0, num_blocks_per_group=1)
+
+        # Final VRAM report
+        for _i in range(torch.cuda.device_count()):
+            _alloc = torch.cuda.memory_allocated(_i) / 1024**3
+            _reserved = torch.cuda.memory_reserved(_i) / 1024**3
+            print(f'[GPU {_i}] after load: allocated={_alloc:.2f}GB  reserved={_reserved:.2f}GB')
 
     pipeline = layerdiff_pipeline
     if cache_tag_embeds:
@@ -147,7 +178,8 @@ def apply_layerdiff(
     scale = pad_size[0] / resolution
     Image.fromarray(fullpage).save(osp.join(saved, 'src_img.png'))
 
-    rng = torch.Generator(device=pipeline.unet.device).manual_seed(seed)
+    # Use _get_device(0) directly — pipeline.unet.device is ambiguous for dispatched models
+    rng = torch.Generator(device=_get_device(0)).manual_seed(seed)
 
     tag_version = pipeline.unet.get_tag_version()
     if tag_version == 'v2':
