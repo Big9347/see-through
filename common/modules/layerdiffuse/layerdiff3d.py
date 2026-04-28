@@ -656,7 +656,18 @@ class UNetFrameConditionModel(
     """
 
     _supports_gradient_checkpointing = True
-    _no_split_modules = ["BasicTransformerBlock", "ResnetBlock2D", "CrossAttnUpBlock2D"]
+    _no_split_modules = [
+        "BasicTransformerBlock",
+        "ResnetBlock2D",
+        "CrossAttnUpBlock2D",
+        # Custom 3D/cross-frame blocks — must NOT be split across GPUs because
+        # their forward() mixes tensors from transformer_blocks and
+        # temporal_transformer_blocks in a single addition (line 453 in transformer3d.py)
+        "Transformer3DModel",
+        "CrossFrameTransformerBlock",
+        "CrossFrameAttnUpBlock",
+        "CrossFrameAttnDownBlock",
+    ]
     _skip_layerwise_casting_patterns = ["norm"]
 
     @register_to_config
