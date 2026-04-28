@@ -83,22 +83,57 @@ def apply_layerdiff(
                 print(f'load vae from {vae_ckpt}')
 
         # -- Device assignment -------------------------------------------------
-        # Primary device (cuda:0): compute-intensive diffusion components
         dev0 = _get_device(0)
-        # Secondary device (cuda:1 when available): text encoders + Marigold
         dev1 = _get_device(1)
 
         layerdiff_pipeline.vae.to(dtype=torch.bfloat16, device=dev0)
         layerdiff_pipeline.trans_vae.to(dtype=torch.bfloat16, device=dev0)
-        layerdiff_pipeline.unet.to(dtype=torch.bfloat16, device=dev0)
-        # Text encoders are large but run once per batch — offload to dev1
+        # Text encoders run once per call — keep on dev1 to free VRAM on dev0
         layerdiff_pipeline.text_encoder.to(dtype=torch.bfloat16, device=dev1)
         layerdiff_pipeline.text_encoder_2.to(dtype=torch.bfloat16, device=dev1)
+
+        if DUAL_GPU_MODE and not group_offload:
+            # ---- Real compute split: dispatch UNet layers across both GPUs ----
+            # accelerate inserts forward-hooks that move activations between
+            # devices so every 30-step denoising iteration uses both T4s.
+            # VAE/TransVAE (~2GB) on cuda:0 + half UNet (~2.5GB) → ~4.5 GB
+            # text encoders (~3.5GB) on cuda:1 + half UNet (~2.5GB) → ~6 GB
+            try:
+                from accelerate import dispatch_model, infer_auto_device_map
+                # Bring UNet to CPU+bf16 so infer_auto_device_map sees sizes correctly
+                layerdiff_pipeline.unet.to(dtype=torch.bfloat16).cpu()
+                # Reserve headroom for activations; T4 has 15 GiB each
+                _max_mem = {0: '9500MiB', 1: '7500MiB'}
+                # Don't split these atom units mid-layer (standard diffusers block names)
+                _no_split = [
+                    'BasicTransformerBlock',
+                    'ResnetBlock2D',
+                    'Transformer2DModel',
+                    'TemporalBasicTransformerBlock',
+                ]
+                unet_map = infer_auto_device_map(
+                    layerdiff_pipeline.unet,
+                    max_memory=_max_mem,
+                    dtype=torch.bfloat16,
+                    no_split_module_classes=_no_split,
+                )
+                layerdiff_pipeline.unet = dispatch_model(
+                    layerdiff_pipeline.unet, device_map=unet_map
+                )
+                _used_devs = set(unet_map.values())
+                print(f'[dual-GPU] UNet dispatched across {_used_devs} | '
+                      f'text encoders → {dev1} | VAE → {dev0}')
+            except Exception as _e:
+                print(f'[dual-GPU] UNet dispatch failed ({_e!r}), falling back to {dev0}')
+                layerdiff_pipeline.unet.to(dtype=torch.bfloat16, device=dev0)
+        else:
+            layerdiff_pipeline.unet.to(dtype=torch.bfloat16, device=dev0)
+            if DUAL_GPU_MODE:
+                # group_offload manages its own device movement
+                print(f'[dual-GPU] group_offload active — UNet managed by offload on {dev0}')
+
         if group_offload:
             layerdiff_pipeline.enable_group_offload(dev0, num_blocks_per_group=1)
-
-        if DUAL_GPU_MODE:
-            print(f'[dual-GPU] layerdiff: UNet/VAE → {dev0} | text encoders → {dev1}')
 
     pipeline = layerdiff_pipeline
     if cache_tag_embeds:
