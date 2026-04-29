@@ -108,12 +108,12 @@ def build_layerdiff_pipeline(args):
         print(f'[NF4] Loading pre-quantized UNet from {repo}')
         unet = UNetFrameConditionModel.from_pretrained(repo, subfolder='unet')
     elif DUAL_GPU_MODE and not args.group_offload:
-        # bf16 + dual-GPU: try to split UNet across GPUs
+        # fp16 + dual-GPU: try to split UNet across GPUs
         try:
             print('[dual-GPU] Loading UNet with device_map="balanced"...')
             unet = UNetFrameConditionModel.from_pretrained(
                 repo, subfolder='unet', device_map='balanced',
-                torch_dtype=torch.bfloat16,
+                torch_dtype=torch.float16,
                 max_memory={0: '7000MiB', 1: '7000MiB'},
                 offload_folder='workspace/offload',
             )
@@ -131,34 +131,42 @@ def build_layerdiff_pipeline(args):
     )
 
     # --- Device placement ---
-    pipeline.vae.to(dtype=torch.bfloat16, device=dev0)
-    pipeline.trans_vae.to(dtype=torch.bfloat16, device=dev0)
-    _safe_to(pipeline.text_encoder, dev1, torch.bfloat16)
-    _safe_to(pipeline.text_encoder_2, dev1, torch.bfloat16)
+    pipeline.vae.to(dtype=torch.float16, device=dev0)
+    pipeline.trans_vae.to(dtype=torch.float16, device=dev0)
+
+    # NF4 quantized text encoders can't be moved between CUDA devices
+    # (CUBLAS handles are tied to the load device). Keep on dev0 for NF4;
+    # cache_tag_embeds() will unload them after encoding anyway.
+    if quant_mode == 'nf4':
+        _safe_to(pipeline.text_encoder, dev0, torch.float16)
+        _safe_to(pipeline.text_encoder_2, dev0, torch.float16)
+    else:
+        _safe_to(pipeline.text_encoder, dev1, torch.float16)
+        _safe_to(pipeline.text_encoder_2, dev1, torch.float16)
 
     if unet_device_map:
         # Already dispatched via device_map
         print(f'[dual-GPU] UNet dispatched | text encoders → {dev1} | VAE → {dev0}')
     elif quant_mode == 'nf4':
-        _safe_to(pipeline.unet, dev0, torch.bfloat16)
+        _safe_to(pipeline.unet, dev0, torch.float16)
     elif DUAL_GPU_MODE and not args.group_offload:
         # bf16 post-hoc dispatch fallback
         try:
             from accelerate import dispatch_model, infer_auto_device_map
-            pipeline.unet.to(dtype=torch.bfloat16).cpu()
+            pipeline.unet.to(dtype=torch.float16).cpu()
             no_split = ['BasicTransformerBlock', 'ResnetBlock2D',
                         'Transformer2DModel', 'TemporalBasicTransformerBlock']
             umap = infer_auto_device_map(
                 pipeline.unet, max_memory={0: '9500MiB', 1: '7500MiB'},
-                dtype=torch.bfloat16, no_split_module_classes=no_split,
+                dtype=torch.float16, no_split_module_classes=no_split,
             )
             pipeline.unet = dispatch_model(pipeline.unet, device_map=umap)
             print(f'[dual-GPU] UNet post-hoc dispatched across {set(umap.values())}')
         except Exception as e:
             print(f'[dual-GPU] dispatch failed: {e!r} — single-GPU fallback')
-            pipeline.unet.to(dtype=torch.bfloat16, device=dev0)
+            pipeline.unet.to(dtype=torch.float16, device=dev0)
     else:
-        pipeline.unet.to(dtype=torch.bfloat16, device=dev0)
+        pipeline.unet.to(dtype=torch.float16, device=dev0)
         if DUAL_GPU_MODE:
             print(f'[dual-GPU] group_offload active — UNet on {dev0}')
 
@@ -178,9 +186,9 @@ def build_marigold_pipeline(args):
 
     if quant_mode == 'nf4':
         unet = UNetFrameConditionModel.from_pretrained(
-            repo, subfolder='unet', torch_dtype=torch.bfloat16)
+            repo, subfolder='unet', torch_dtype=torch.float16)
         pipe = MarigoldDepthPipeline.from_pretrained(
-            repo, unet=unet, torch_dtype=torch.bfloat16)
+            repo, unet=unet, torch_dtype=torch.float16)
         pipe.vae.to(device=marigold_dev)
         _safe_to(pipe.unet, marigold_dev)
         if not _is_quantized(pipe.text_encoder):
@@ -191,13 +199,14 @@ def build_marigold_pipeline(args):
         pipe = MarigoldDepthPipeline.from_pretrained(
             repo, unet=unet, torch_dtype=torch.float16)
         pipe.to(device=marigold_dev, dtype=torch.float16)
-        # Memory-efficient attention for bf16 with many body parts
-        try:
-            pipe.enable_xformers_memory_efficient_attention()
-            print('[marigold] xformers memory-efficient attention ✓')
-        except Exception:
-            pipe.enable_attention_slicing(slice_size=1)
-            print('[marigold] attention slicing (1 head) ✓')
+
+    # Memory-efficient attention (fp16 compatible with xformers on T4)
+    try:
+        pipe.enable_xformers_memory_efficient_attention()
+        print('[marigold] xformers memory-efficient attention ✓')
+    except Exception:
+        pipe.enable_attention_slicing(slice_size=1)
+        print('[marigold] xformers unavailable — attention slicing (1 head) ✓')
 
     if args.group_offload:
         pipe.enable_group_offload(marigold_dev, num_blocks_per_group=1)
