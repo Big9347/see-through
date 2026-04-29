@@ -14,6 +14,7 @@ Usage (from repo root):
 
 import os.path as osp
 import argparse
+import gc
 import sys
 import os
 
@@ -174,6 +175,25 @@ def build_layerdiff_pipeline(args):
         if DUAL_GPU_MODE:
             print(f'[dual-GPU] group_offload active — UNet on {dev0}')
 
+    # --- Memory-efficient attention for LayerDiff UNet ---
+    try:
+        pipeline.enable_xformers_memory_efficient_attention()
+        print('[layerdiff] xformers memory-efficient attention ✓')
+    except Exception:
+        pipeline.enable_attention_slicing(slice_size=1)
+        print('[layerdiff] xformers unavailable — attention slicing (1 head) ✓')
+
+    # --- VAE tiling: splits large images into overlapping tiles during encode/decode ---
+    pipeline.enable_vae_tiling()
+    print('[layerdiff] VAE tiling ✓')
+
+    # --- channels_last memory format for conv-heavy modules (skip NF4 UNet) ---
+    pipeline.vae.to(memory_format=torch.channels_last)
+    pipeline.trans_vae.to(memory_format=torch.channels_last)
+    if quant_mode != 'nf4' and not unet_device_map:
+        pipeline.unet.to(memory_format=torch.channels_last)
+    print('[layerdiff] channels_last memory format ✓')
+
     # Cache tag embeddings BEFORE enabling group_offload.
     # group_offload installs hooks that move submodules between CPU↔CUDA on
     # each forward call — this breaks NF4 quantized layers (CUBLAS handle
@@ -218,6 +238,11 @@ def build_marigold_pipeline(args):
     except Exception:
         pipe.enable_attention_slicing(slice_size=1)
         print('[marigold] xformers unavailable — attention slicing (1 head) ✓')
+
+    # --- channels_last memory format for conv-heavy modules ---
+    pipe.unet.to(memory_format=torch.channels_last)
+    pipe.vae.to(memory_format=torch.channels_last)
+    print('[marigold] channels_last memory format ✓')
 
     if args.group_offload:
         pipe.enable_group_offload(marigold_dev, num_blocks_per_group=1)
@@ -507,6 +532,10 @@ if __name__ == '__main__':
         run_layerdiff(ld_pipeline, srcp, args.save_dir, args.seed,
                       args.num_inference_steps, args.resolution)
         print(f'  LayerDiff3D done in {time.time() - ld_t0:.1f}s')
+
+        # Free cached VRAM between pipeline runs
+        gc.collect()
+        torch.cuda.empty_cache()
 
         print(f'--- Marigold depth: {srcp} ---')
         mg_t0 = time.time()
