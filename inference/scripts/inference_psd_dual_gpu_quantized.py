@@ -138,8 +138,12 @@ def build_layerdiff_pipeline(args):
     # (CUBLAS handles are tied to the load device). Keep on dev0 for NF4;
     # cache_tag_embeds() will unload them after encoding anyway.
     if quant_mode == 'nf4':
-        _safe_to(pipeline.text_encoder, dev0, torch.float16)
-        _safe_to(pipeline.text_encoder_2, dev0, torch.float16)
+        # Don't move quantized text encoders — bnb placed them during from_pretrained.
+        # Just ensure non-quantized ones get to the right device.
+        if not _is_quantized(pipeline.text_encoder):
+            pipeline.text_encoder.to(dtype=torch.float16, device=dev0)
+        if not _is_quantized(pipeline.text_encoder_2):
+            pipeline.text_encoder_2.to(dtype=torch.float16, device=dev0)
     else:
         _safe_to(pipeline.text_encoder, dev1, torch.float16)
         _safe_to(pipeline.text_encoder_2, dev1, torch.float16)
@@ -172,6 +176,16 @@ def build_layerdiff_pipeline(args):
 
     if args.group_offload:
         pipeline.enable_group_offload(dev0, num_blocks_per_group=1)
+
+    # Warm up CUBLAS on the text encoder device before NF4 matmul.
+    # bitsandbytes matmul_4bit requires an initialized CUBLAS handle;
+    # on Kaggle T4x2 it may not exist until the first real CUDA op on that device.
+    if quant_mode == 'nf4':
+        _te_dev = next(pipeline.text_encoder.parameters()).device
+        if _te_dev.type == 'cuda':
+            _warmup = torch.zeros(1, device=_te_dev) @ torch.zeros(1, 1, device=_te_dev)
+            del _warmup
+            print(f'[NF4] CUBLAS warmup on {_te_dev} ✓')
 
     pipeline.cache_tag_embeds()
     _print_gpu_report('after LayerDiff load')
