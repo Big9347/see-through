@@ -174,20 +174,17 @@ def build_layerdiff_pipeline(args):
         if DUAL_GPU_MODE:
             print(f'[dual-GPU] group_offload active — UNet on {dev0}')
 
+    # Cache tag embeddings BEFORE enabling group_offload.
+    # group_offload installs hooks that move submodules between CPU↔CUDA on
+    # each forward call — this breaks NF4 quantized layers (CUBLAS handle
+    # becomes invalid). By caching first, text encoders run on their
+    # stable CUDA device, then cache_tag_embeds() deletes them, so the
+    # subsequent group_offload hooks never touch quantized text encoder layers.
+    pipeline.cache_tag_embeds()
+
     if args.group_offload:
         pipeline.enable_group_offload(dev0, num_blocks_per_group=1)
 
-    # Warm up CUBLAS on the text encoder device before NF4 matmul.
-    # bitsandbytes matmul_4bit requires an initialized CUBLAS handle;
-    # on Kaggle T4x2 it may not exist until the first real CUDA op on that device.
-    if quant_mode == 'nf4':
-        _te_dev = next(pipeline.text_encoder.parameters()).device
-        if _te_dev.type == 'cuda':
-            _warmup = torch.zeros(1, device=_te_dev) @ torch.zeros(1, 1, device=_te_dev)
-            del _warmup
-            print(f'[NF4] CUBLAS warmup on {_te_dev} ✓')
-
-    pipeline.cache_tag_embeds()
     _print_gpu_report('after LayerDiff load')
     return pipeline
 
@@ -453,8 +450,8 @@ if __name__ == '__main__':
                         help='Marigold denoising steps (-1 = default)')
     parser.add_argument('--resolution_depth', type=int, default=768,
                         help='Marigold depth resolution (-1 to match layerdiff)')
-    parser.add_argument('--group_offload', action='store_true', default=True,
-                        help='Enable group offload (default: on)')
+    parser.add_argument('--group_offload', action='store_true', default=False,
+                        help='Enable group offload to reduce peak VRAM')
     parser.add_argument('--no_group_offload', action='store_false', dest='group_offload')
     parser.add_argument('--disable_progressbar', action='store_true')
     args = parser.parse_args()
